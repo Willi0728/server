@@ -114,38 +114,183 @@ impl ChunkSection {
             biomes: BiomePalettedContainer::Single(0),
         }
     }
+
     pub fn set_block(&mut self, x: u8, y: u8, z: u8, block_state: u16) {
-        if x > 15 || y > 15 || z > 15 { return; }
-        use PalettedContainer::*;
-        match &mut self.block_states {
-            Single(n) if block_state == *n => (),
-            Single(n) => {
-                self.block_states = Indirect {
-                    bits_per_entry: 1,
-                    palette: vec![*n, block_state],
-                    data: vec![0u64].repeat(64)
-                };
-                let (i, j) = Self::index(x, y, z, 1);
-                let Indirect{bits_per_entry: _, palette: _, ref mut data} = self.block_states else {
-                    eprintln!("Block states were changed while setting block {x} {y} {z} to {block_state} from Simple to Indirect");
-                    return;
-                };
-                data[i] = 1 << j;
-            },
-            &mut Indirect { ref bits_per_entry, ref palette, ref mut data } if palette.contains(&block_state) => {
-                let (i, j) = Self::index(x, y, z, *bits_per_entry);
-                let Some(index) = palette.iter().position(|x| *x == block_state) else {
-                    eprintln!("Block states were changed while setting block {x} {y} {z} to {block_state} from Indirect to Indirect");
-                    return;
-                };
-                data[i] |= (index as u64) << j as u64;
-            }
-            _ => ()
+        if x > 15 || y > 15 || z > 15 {
+            return;
+        }
+
+        let entry_index = Self::entry_index(x, y, z);
+        self.block_states =
+            match std::mem::replace(&mut self.block_states, PalettedContainer::Single(0)) {
+                PalettedContainer::Single(state) if block_state == state => {
+                    PalettedContainer::Single(state)
+                }
+                PalettedContainer::Single(state) => {
+                    let bits_per_entry = 1;
+                    let mut data = vec![0; Self::packed_word_count(bits_per_entry)];
+                    Self::set_packed_entry(&mut data, entry_index, bits_per_entry, 1);
+                    PalettedContainer::Indirect {
+                        bits_per_entry,
+                        palette: vec![state, block_state],
+                        data,
+                    }
+                }
+                PalettedContainer::Indirect {
+                    mut bits_per_entry,
+                    mut palette,
+                    mut data,
+                } => {
+                    let palette_index = match palette.iter().position(|&state| state == block_state)
+                    {
+                        Some(index) => index,
+                        None => {
+                            let next_index = palette.len();
+                            let required_bits = Self::bits_required_for_palette_len(next_index + 1);
+                            if required_bits > bits_per_entry {
+                                data =
+                                    Self::repack_packed_data(&data, bits_per_entry, required_bits);
+                                bits_per_entry = required_bits;
+                            }
+                            palette.push(block_state);
+                            next_index
+                        }
+                    };
+
+                    Self::set_packed_entry(
+                        &mut data,
+                        entry_index,
+                        bits_per_entry,
+                        palette_index as u64,
+                    );
+                    PalettedContainer::Indirect {
+                        bits_per_entry,
+                        palette,
+                        data,
+                    }
+                }
+                PalettedContainer::Direct(mut data) => {
+                    data[entry_index] = block_state;
+                    PalettedContainer::Direct(data)
+                }
+            };
+    }
+
+    fn set_packed_entry(data: &mut [u64], entry_index: usize, bits_per_entry: u8, value: u64) {
+        let (word_index, bit_offset) = Self::bit_index(entry_index, bits_per_entry);
+        let mask = Self::entry_mask(bits_per_entry);
+        let value = value & mask;
+
+        data[word_index] &= !(mask << bit_offset);
+        data[word_index] |= value << bit_offset;
+    }
+
+    fn packed_entry(data: &[u64], entry_index: usize, bits_per_entry: u8) -> u64 {
+        let (word_index, bit_offset) = Self::bit_index(entry_index, bits_per_entry);
+        let mask = Self::entry_mask(bits_per_entry);
+        (data[word_index] >> bit_offset) & mask
+    }
+
+    fn repack_packed_data(
+        data: &[u64],
+        old_bits_per_entry: u8,
+        new_bits_per_entry: u8,
+    ) -> Vec<u64> {
+        let mut repacked = vec![0; Self::packed_word_count(new_bits_per_entry)];
+        for entry_index in 0..4096 {
+            let value = Self::packed_entry(data, entry_index, old_bits_per_entry);
+            Self::set_packed_entry(&mut repacked, entry_index, new_bits_per_entry, value);
+        }
+        repacked
+    }
+
+    fn bit_index(entry_index: usize, bits_per_entry: u8) -> (usize, u8) {
+        let entries_per_word = Self::entries_per_word(bits_per_entry);
+        let word_index = entry_index / entries_per_word;
+        let bit_offset = ((entry_index % entries_per_word) * bits_per_entry as usize) as u8;
+        (word_index, bit_offset)
+    }
+
+    fn entry_index(x: u8, y: u8, z: u8) -> usize {
+        y as usize * 256 + z as usize * 16 + x as usize
+    }
+
+    fn packed_word_count(bits_per_entry: u8) -> usize {
+        4096usize.div_ceil(Self::entries_per_word(bits_per_entry))
+    }
+
+    fn entries_per_word(bits_per_entry: u8) -> usize {
+        64 / bits_per_entry as usize
+    }
+
+    fn bits_required_for_palette_len(palette_len: usize) -> u8 {
+        debug_assert!(palette_len >= 2);
+        usize::BITS.saturating_sub((palette_len - 1).leading_zeros()) as u8
+    }
+
+    fn entry_mask(bits_per_entry: u8) -> u64 {
+        debug_assert!(bits_per_entry > 0 && bits_per_entry <= 64);
+        if bits_per_entry == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits_per_entry) - 1
         }
     }
-    fn index(x: u8, y: u8, z: u8, bpe: u8) -> (usize, u8) {
-        let mut index = y as u32 * 256 + z as u32 * 16 + x as u32;
-        index *= bpe as u32;
-        ((index >> 6) as usize, (index & 63) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkSection, PalettedContainer};
+
+    #[test]
+    fn grows_palette_and_repacks_existing_entries() {
+        let mut section = ChunkSection::new();
+        section.set_block(0, 0, 0, 1);
+        section.set_block(1, 0, 0, 2);
+        section.set_block(2, 0, 0, 3);
+
+        let PalettedContainer::Indirect {
+            bits_per_entry,
+            palette,
+            data,
+        } = &section.block_states
+        else {
+            panic!("expected indirect block states");
+        };
+
+        assert_eq!(*bits_per_entry, 2);
+        assert_eq!(palette, &vec![0, 1, 2, 3]);
+        assert_eq!(
+            ChunkSection::packed_entry(data, ChunkSection::entry_index(0, 0, 0), *bits_per_entry),
+            1
+        );
+        assert_eq!(
+            ChunkSection::packed_entry(data, ChunkSection::entry_index(1, 0, 0), *bits_per_entry),
+            2
+        );
+        assert_eq!(
+            ChunkSection::packed_entry(data, ChunkSection::entry_index(2, 0, 0), *bits_per_entry),
+            3
+        );
+    }
+
+    #[test]
+    fn packed_entries_use_padded_word_boundaries() {
+        let mut data = vec![0; ChunkSection::packed_word_count(5)];
+        let last_in_first_word = 11;
+        let first_in_second_word = 12;
+
+        ChunkSection::set_packed_entry(&mut data, last_in_first_word, 5, 0b0_1010);
+        ChunkSection::set_packed_entry(&mut data, first_in_second_word, 5, 0b1_1010);
+
+        assert_eq!(
+            ChunkSection::packed_entry(&data, last_in_first_word, 5),
+            0b0_1010
+        );
+        assert_eq!(
+            ChunkSection::packed_entry(&data, first_in_second_word, 5),
+            0b1_1010
+        );
+        assert_eq!(data[0] >> 60, 0);
     }
 }

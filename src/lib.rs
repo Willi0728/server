@@ -135,10 +135,14 @@ impl VarInt {
     /// If the data is completely invalid (i.e. no bytes), returns `Err`.
     /// If you choose to do this:
     /// ```
-    /// match decode(some_bytes) {
-    ///     Ok(val) | Incomplete(val) => val,
-    ///     Err => 0,
-    /// }
+    /// use server::{DecodeResult, VarInt};
+    ///
+    /// let decoded = match VarInt::decode(&[0x80]) {
+    ///     (_, DecodeResult::Ok(val)) | (_, DecodeResult::Incomplete(val)) => val,
+    ///     (_, DecodeResult::Err) => VarInt::new(0),
+    /// };
+    ///
+    /// assert_eq!(decoded.value(), 0);
     /// ```
     /// This is guranteed to give you the lower 32 bits of the VarInt.
     ///
@@ -398,7 +402,7 @@ pub fn create_tags(_registries: Vec<(String, Vec<(String, Vec<VarInt>)>)>) -> Ve
 pub fn login_start(data: &[u8]) -> Option<(String, u128)> {
     let (name, read) = next_string_len(data)?;
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(data.get(read as usize..read as usize+16)?);
+    bytes.copy_from_slice(data.get(read as usize..read as usize + 16)?);
     let uuid = u128::from_be_bytes(bytes);
     Some((name, uuid))
 }
