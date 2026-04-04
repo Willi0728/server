@@ -176,6 +176,19 @@ impl ChunkSection {
             };
     }
 
+    pub fn get_block_state(&self, x: u8, y: u8, z: u8) -> u16 {
+        let entry_index = Self::entry_index(x, y, z);
+        match &self.block_states {
+            PalettedContainer::Single(s) => *s,
+            PalettedContainer::Indirect {
+                bits_per_entry,
+                palette,
+                data,
+            } => palette[Self::packed_entry(data, entry_index, *bits_per_entry) as usize],
+            PalettedContainer::Direct(data) => data[entry_index],
+        }
+    }
+
     fn set_packed_entry(data: &mut [u64], entry_index: usize, bits_per_entry: u8, value: u64) {
         let (word_index, bit_offset) = Self::bit_index(entry_index, bits_per_entry);
         let mask = Self::entry_mask(bits_per_entry);
