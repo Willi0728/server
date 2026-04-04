@@ -176,7 +176,7 @@ impl ChunkSection {
             };
     }
 
-    pub fn get_block_state(&self, x: u8, y: u8, z: u8) -> u16 {
+    pub fn get_block(&self, x: u8, y: u8, z: u8) -> u16 {
         let entry_index = Self::entry_index(x, y, z);
         match &self.block_states {
             PalettedContainer::Single(s) => *s,
@@ -187,6 +187,20 @@ impl ChunkSection {
             } => palette[Self::packed_entry(data, entry_index, *bits_per_entry) as usize],
             PalettedContainer::Direct(data) => data[entry_index],
         }
+    }
+
+    pub fn fill(&mut self, (x1, y1, z1): (u8, u8, u8), (x2, y2, z2): (u8, u8, u8), block_state: u16) {
+        for x in x1..x2 {
+            for y in y1..y2 {
+                for z in z1..z2 {
+                    self.set_block(x, y, z, block_state);
+                }
+            }
+        }
+    }
+
+    pub fn fill_all(&mut self, block_state: u16) {
+        self.block_states = PalettedContainer::Single(block_state);
     }
 
     fn set_packed_entry(data: &mut [u64], entry_index: usize, bits_per_entry: u8, value: u64) {
