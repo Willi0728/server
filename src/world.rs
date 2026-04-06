@@ -1,8 +1,6 @@
-use bytemuck;
+use crate::*;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::mem::ManuallyDrop;
-use crate::*;
 
 const fn generate_arrays() -> [[u8; 2048]; 16] {
     let mut out = [[0u8; 2048]; 16];
@@ -65,52 +63,122 @@ pub type BiomePalettedContainer = PalettedContainer<u8>;
 
 impl Serialize for BlockPalettedContainer {
     fn serialize(&self) -> Vec<u8> {
-        let mut out = vec![];
         match self {
-            Self::Single(n) => {
-                out.push(0); //bpe
-                out.extend(n.to_be_bytes()); // palette
-                // data array skipped
+            Self::Single(n) => serialize_single_paletted(*n),
+            Self::Indirect {
+                bits_per_entry,
+                palette,
+                data,
+            } => {
+                let wire_bits_per_entry = (*bits_per_entry).max(4);
+                let wire_data = if wire_bits_per_entry == *bits_per_entry {
+                    data.clone()
+                } else {
+                    ChunkSection::repack_packed_data(data, *bits_per_entry, wire_bits_per_entry)
+                };
+                serialize_indirect_paletted(
+                    wire_bits_per_entry,
+                    &palette
+                        .iter()
+                        .map(|&entry| VarInt::new(entry as i32))
+                        .collect::<Vec<_>>(),
+                    &wire_data,
+                )
             }
-            Self::Indirect { bits_per_entry, palette, data } => {
-                out.push(*bits_per_entry); //bpe
-                out.extend_from_slice(bytemuck::cast_slice(palette)); //palette
-                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
-            }
-            Self::Direct(data) => {
-                out.push(15);
-                // palette skipped
-                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
-            },
+            Self::Direct(data) => serialize_direct_paletted(
+                15,
+                &data.iter().map(|&entry| entry as u64).collect::<Vec<_>>(),
+            ),
         }
-        out
     }
 }
 
 impl Serialize for BiomePalettedContainer {
     fn serialize(&self) -> Vec<u8> {
-        let mut out = vec![];
         match self {
-            Self::Single(n) => {
-                out.push(0); //bpe
-                out.extend(n.to_be_bytes()); // palette
-                // data array skipped
-            }
-            Self::Indirect { bits_per_entry, palette, data } => {
-                out.push(*bits_per_entry); //bpe
-                out.extend_from_slice(palette); //palette
-                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
-            }
+            Self::Single(n) => serialize_single_paletted(*n),
+            Self::Indirect {
+                bits_per_entry,
+                palette,
+                data,
+            } => serialize_indirect_paletted(
+                (*bits_per_entry).max(1),
+                &palette
+                    .iter()
+                    .map(|&entry| VarInt::new(entry as i32))
+                    .collect::<Vec<_>>(),
+                data,
+            ),
             Self::Direct(data) => {
-                out.push(15);
-                // palette skipped
-                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
-            },
+                let bits_per_entry = bits_required_for_value_range(
+                    data.iter().copied().map(u64::from).max().unwrap_or(0),
+                );
+                serialize_direct_paletted(
+                    bits_per_entry,
+                    &data.iter().map(|&entry| entry as u64).collect::<Vec<_>>(),
+                )
+            }
         }
-        out
     }
 }
 
+fn serialize_single_paletted<T: Into<i32>>(value: T) -> Vec<u8> {
+    let mut out = vec![0];
+    out.extend(VarInt::new(value.into()).serialize());
+    out
+}
+
+fn serialize_indirect_paletted(
+    bits_per_entry: u8,
+    palette: &[VarInt],
+    data: &[u64],
+) -> Vec<u8> {
+    let mut out = vec![bits_per_entry];
+    out.extend(palette.serialize());
+    out.extend(serialize_long_array(data));
+    out
+}
+
+fn serialize_direct_paletted(bits_per_entry: u8, values: &[u64]) -> Vec<u8> {
+    let mut out = vec![bits_per_entry];
+    out.extend(serialize_long_array(&pack_entries(values, bits_per_entry)));
+    out
+}
+
+fn serialize_long_array(data: &[u64]) -> Vec<u8> {
+    let mut out = VarInt::new(data.len() as i32).serialize();
+    for word in data {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn pack_entries(values: &[u64], bits_per_entry: u8) -> Vec<u64> {
+    let entries_per_word = 64 / bits_per_entry as usize;
+    let mut out = vec![0; values.len().div_ceil(entries_per_word)];
+    let mask = entry_mask(bits_per_entry);
+
+    for (entry_index, value) in values.iter().copied().enumerate() {
+        let word_index = entry_index / entries_per_word;
+        let bit_offset = ((entry_index % entries_per_word) * bits_per_entry as usize) as u8;
+        out[word_index] |= (value & mask) << bit_offset;
+    }
+
+    out
+}
+
+fn bits_required_for_value_range(max: u64) -> u8 {
+    (u64::BITS.saturating_sub(max.leading_zeros())).max(1) as u8
+}
+
+fn entry_mask(bits_per_entry: u8) -> u64 {
+    debug_assert!(bits_per_entry > 0 && bits_per_entry <= 64);
+    if bits_per_entry == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits_per_entry) - 1
+    }
+}
 
 impl Level {
     pub fn tick(&mut self) {
@@ -174,6 +242,9 @@ impl Level {
 }
 
 impl LevelChunk {
+    const LIGHT_SECTION_COUNT: usize = 26;
+    const LIGHT_SECTION_MASK: u64 = (1u64 << Self::LIGHT_SECTION_COUNT) - 1;
+
     pub fn new() -> Self {
         use std::array::from_fn;
         Self {
@@ -182,14 +253,41 @@ impl LevelChunk {
             blocklight: from_fn(|_| LightSection::new()),
         }
     }
-    fn bitset(light: &[LightSection; 26]) -> Vec<u8> {
-        let mut out = vec![0; light.len().div_ceil(8)];
+
+    fn light_mask(light: &[LightSection; 26]) -> u64 {
+        let mut out = 0u64;
         for (i, section) in light.iter().enumerate() {
             if !matches!(section, LightSection::Single(0)) {
-                out[i / 8] |= 1 << (i % 8);
+                out |= 1 << i;
             }
         }
         out
+    }
+
+    fn write_bitset(to: &mut Vec<u8>, mask: u64) {
+        if mask == 0 {
+            to.extend(0i32.serialize());
+            return;
+        }
+
+        to.extend(1i32.serialize());
+        to.extend_from_slice(&mask.to_be_bytes());
+    }
+
+    fn write_light_sections(light: &[LightSection; 26], to: &mut Vec<u8>) {
+        let present_count = light
+            .iter()
+            .filter(|section| !matches!(section, LightSection::Single(0)))
+            .count();
+        to.extend((present_count as i32).serialize());
+        for section in light {
+            if !matches!(section, LightSection::Single(0)) {
+                to.extend(2048i32.serialize());
+                section
+                    .write_to(to)
+                    .expect("Vec<u8> writes do not fail");
+            }
+        }
     }
 
     fn serialize(&self, x: i32, z: i32) -> Vec<u8> {
@@ -207,26 +305,18 @@ impl LevelChunk {
         }
         out.extend((data.len() as i32).serialize()); // no way chunk data is bigger than i32::MAX bytes...right?
         out.extend(data);
+        out.extend(0i32.serialize()); // no block entities yet
         // Bitset  set 1
-        let mut skyset = Self::bitset(&self.skylight);
-        let mut blockset = Self::bitset(&self.blocklight);
-        out.extend_from_slice(&skyset);
-        out.extend_from_slice(&blockset);
-        //invert
-        for v in skyset.iter_mut() {
-            *v = 0xFF - *v;
-        }
-        for v in blockset.iter_mut() {
-            *v = 0xFF - *v;
-        }
-        out.extend_from_slice(&skyset);
-        out.extend_from_slice(&blockset);
-        for i in &self.skylight {
-            i.write_to(&mut out);
-        }
-        for i in &self.blocklight {
-            i.write_to(&mut out);
-        }
+        let skyset = Self::light_mask(&self.skylight);
+        let blockset = Self::light_mask(&self.blocklight);
+        let empty_skyset = Self::LIGHT_SECTION_MASK ^ skyset;
+        let empty_blockset = Self::LIGHT_SECTION_MASK ^ blockset;
+        Self::write_bitset(&mut out, skyset);
+        Self::write_bitset(&mut out, blockset);
+        Self::write_bitset(&mut out, empty_skyset);
+        Self::write_bitset(&mut out, empty_blockset);
+        Self::write_light_sections(&self.skylight, &mut out);
+        Self::write_light_sections(&self.blocklight, &mut out);
         out
     }
 }
@@ -258,6 +348,7 @@ impl ChunkSection {
             return;
         }
 
+        let previous_block_state = self.get_block(x, y, z);
         let entry_index = Self::entry_index(x, y, z);
         self.block_states =
             match std::mem::replace(&mut self.block_states, PalettedContainer::Single(0)) {
@@ -312,6 +403,12 @@ impl ChunkSection {
                     PalettedContainer::Direct(data)
                 }
             };
+
+        match (previous_block_state == 0, block_state == 0) {
+            (true, false) => self.block_count += 1,
+            (false, true) => self.block_count -= 1,
+            _ => (),
+        }
     }
 
     pub fn get_block(&self, x: u8, y: u8, z: u8) -> u16 {
@@ -339,6 +436,7 @@ impl ChunkSection {
 
     pub fn fill_all(&mut self, block_state: u16) {
         self.block_states = PalettedContainer::Single(block_state);
+        self.block_count = if block_state == 0 { 0 } else { 4096 };
     }
 
     fn set_packed_entry(data: &mut [u64], entry_index: usize, bits_per_entry: u8, value: u64) {
@@ -394,12 +492,7 @@ impl ChunkSection {
     }
 
     fn entry_mask(bits_per_entry: u8) -> u64 {
-        debug_assert!(bits_per_entry > 0 && bits_per_entry <= 64);
-        if bits_per_entry == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits_per_entry) - 1
-        }
+        entry_mask(bits_per_entry)
     }
 }
 
