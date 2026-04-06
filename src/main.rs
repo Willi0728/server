@@ -55,7 +55,7 @@ const BASE_DATA: &[u8] = indoc! {r#"
     portal_cooldown = 300
     sea_level = 64
     enforce_secure_chat = false
-"#}
+ "#}
 .as_bytes();
 const REGISTRY_DATA: &[u8] = include_bytes!("registry_data.bin");
 const UPDATE_TAGS: &[u8] = include_bytes!("update_tags.bin");
@@ -213,15 +213,14 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
         tempbuf.extend(assemble(0x2C, &chunk));
         event!(Level::TRACE, "Sent chunk {x}, {z}");
     }
-    conn.write_all(&tempbuf).ok()?;
     conn.write_all(&assemble(
         0x5F,
-        &set_default_spawn_position("minecraft:overworld".to_owned(), (8, 100, 8), 0.0, 0.0), //TODO make this a config
+        &set_default_spawn_position("minecraft:overworld".to_owned(), (8, -30, 8), 0.0, 0.0), //TODO make this a config
     ))
     .ok()?;
     conn.write_all(&assemble(
         0x46,
-        &player_position(0, 8.0, 100.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0),
+        &player_position(0, 8.0, -30.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0),
     ))
     .ok()?;
     event!(Level::TRACE, "Synchronized player position");
@@ -234,6 +233,8 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
         ctx.name,
         Instant::now().checked_duration_since(ctx.connected_at)?
     );
+
+    conn.write_all(&tempbuf).ok()?;
 
     loop {
         if let Some(packet) = conn.read_one().ok()? {
@@ -471,19 +472,24 @@ fn main() {
         Err(e) => match e.kind() {
             ErrorKind::NotFound => {
                 if let Err(e) = fs::write(CONFIG_FILE, BASE_DATA) {
-                    panic!("Could not write default config to file: {e}");
+                    event!(Level::ERROR, "Could not write default config to file: {e}");
+                    return;
                 }
                 BASE_DATA.to_vec()
             }
             ErrorKind::PermissionDenied => {
-                panic!("Permission denied reading config file.")
+                event!(Level::ERROR, "Permission denied reading config file.");
+                return;
             }
-            e => panic!("Unknown error reading config file: {e}"),
+            e => {
+                event!(Level::ERROR, "Unknown error reading config file: {e}");
+                return;
+            },
         },
     };
     let settings = String::from_utf8(settings).expect("Config file contains invalid UTF-8.");
     let settings: Config =
-        toml::from_str(&settings).expect("Invalid config format. Maybe try deleting config.toml?");
+        toml::from_str(&settings).expect("Invalid config format. Maybe try deleting or moving config.toml?");
     let threads = Arc::new(AtomicI32::new(0));
     let listener =
         TcpListener::bind(SocketAddr::new(settings.server.bind, settings.server.port)).unwrap();

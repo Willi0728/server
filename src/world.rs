@@ -1,5 +1,20 @@
+use bytemuck;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::mem::ManuallyDrop;
+use crate::*;
+
+const fn generate_arrays() -> [[u8; 2048]; 16] {
+    let mut out = [[0u8; 2048]; 16];
+    let mut v = 0;
+    while v < 16 {
+        out[v] = [((v as u8) << 4) | (v as u8); 2048];
+        v += 1;
+    }
+    out
+}
+
+const LIGHT_SECTION: [[u8; 2048]; 16] = generate_arrays();
 
 pub enum TaskSchedule {
     EveryTick,
@@ -20,6 +35,13 @@ pub struct Level {
 
 pub struct LevelChunk {
     sections: [ChunkSection; 24],
+    skylight: [LightSection; 26],
+    blocklight: [LightSection; 26],
+}
+
+pub enum LightSection {
+    Single(u8),
+    Direct([u8; 2048]),
 }
 
 pub struct ChunkSection {
@@ -40,6 +62,55 @@ pub enum PalettedContainer<T> {
 
 pub type BlockPalettedContainer = PalettedContainer<u16>;
 pub type BiomePalettedContainer = PalettedContainer<u8>;
+
+impl Serialize for BlockPalettedContainer {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = vec![];
+        match self {
+            Self::Single(n) => {
+                out.push(0); //bpe
+                out.extend(n.to_be_bytes()); // palette
+                // data array skipped
+            }
+            Self::Indirect { bits_per_entry, palette, data } => {
+                out.push(*bits_per_entry); //bpe
+                out.extend_from_slice(bytemuck::cast_slice(palette)); //palette
+                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
+            }
+            Self::Direct(data) => {
+                out.push(15);
+                // palette skipped
+                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
+            },
+        }
+        out
+    }
+}
+
+impl Serialize for BiomePalettedContainer {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = vec![];
+        match self {
+            Self::Single(n) => {
+                out.push(0); //bpe
+                out.extend(n.to_be_bytes()); // palette
+                // data array skipped
+            }
+            Self::Indirect { bits_per_entry, palette, data } => {
+                out.push(*bits_per_entry); //bpe
+                out.extend_from_slice(palette); //palette
+                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
+            }
+            Self::Direct(data) => {
+                out.push(15);
+                // palette skipped
+                out.extend_from_slice(bytemuck::cast_slice(data)); // data array
+            },
+        }
+        out
+    }
+}
+
 
 impl Level {
     pub fn tick(&mut self) {
@@ -96,13 +167,80 @@ impl Level {
     pub fn once<F: TaskClosure>(&mut self, closure: F, when: u64) {
         self.register_task((Box::new(closure), TaskSchedule::Once(when)));
     }
+
+    pub fn serialize(&self, x: i32, z: i32) -> Option<Vec<u8>> {
+        Some(self.chunks.get(&(x, z))?.serialize(x, z))
+    }
 }
 
 impl LevelChunk {
     pub fn new() -> Self {
+        use std::array::from_fn;
         Self {
-            sections: std::array::from_fn(|_| ChunkSection::new()),
+            sections: from_fn(|_| ChunkSection::new()),
+            skylight: from_fn(|_| LightSection::new()),
+            blocklight: from_fn(|_| LightSection::new()),
         }
+    }
+    fn bitset(light: &[LightSection; 26]) -> Vec<u8> {
+        let mut out = vec![0; light.len().div_ceil(8)];
+        for (i, section) in light.iter().enumerate() {
+            if !matches!(section, LightSection::Single(0)) {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
+    }
+
+    fn serialize(&self, x: i32, z: i32) -> Vec<u8> {
+        let mut out = vec![];
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        out.extend(<[i32]>::serialize(&[])); // heightmaps
+        out.extend(<[i32]>::serialize(&[])); // heightmaps
+        // byte[]
+        let mut data: Vec<u8> = vec![];
+        for i in &self.sections {
+            data.extend(i.block_count.to_be_bytes());
+            data.extend(i.block_states.serialize());
+            data.extend(i.biomes.serialize());
+        }
+        out.extend((data.len() as i32).serialize()); // no way chunk data is bigger than i32::MAX bytes...right?
+        out.extend(data);
+        // Bitset  set 1
+        let mut skyset = Self::bitset(&self.skylight);
+        let mut blockset = Self::bitset(&self.blocklight);
+        out.extend_from_slice(&skyset);
+        out.extend_from_slice(&blockset);
+        //invert
+        for v in skyset.iter_mut() {
+            *v = 0xFF - *v;
+        }
+        for v in blockset.iter_mut() {
+            *v = 0xFF - *v;
+        }
+        out.extend_from_slice(&skyset);
+        out.extend_from_slice(&blockset);
+        for i in &self.skylight {
+            i.write_to(&mut out);
+        }
+        for i in &self.blocklight {
+            i.write_to(&mut out);
+        }
+        out
+    }
+}
+
+impl LightSection {
+    pub fn new() -> Self {
+        Self::Single(0)
+    }
+
+    fn write_to<W: Write>(&self, to: &mut W) -> io::Result<()> {
+        to.write_all(match self {
+            Self::Single(n) => &LIGHT_SECTION[*n as usize],
+            Self::Direct(a) => a,
+        })
     }
 }
 
@@ -267,7 +405,7 @@ impl ChunkSection {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkSection, PalettedContainer};
+    use super::*;
 
     #[test]
     fn grows_palette_and_repacks_existing_entries() {
