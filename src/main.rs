@@ -6,6 +6,7 @@ use server::world::*;
 use server::*;
 use sha2::{Digest, Sha256};
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
@@ -51,7 +52,7 @@ const BASE_DATA: &[u8] = indoc! {r#"
     respawn_screen = true
     limited_crafting = false
     seed = 0
-    default_gamemode = 3
+    default_gamemode = 1
     debug = false
     superflat = true
     portal_cooldown = 300
@@ -111,6 +112,29 @@ struct PlayerContext {
     connected_addr: String,
     connected_port: u16,
     connected_at: Instant,
+}
+
+struct ThreadsGuard<'a> {
+    threads: &'a AtomicI32,
+}
+
+impl Drop for ThreadsGuard<'_> {
+    fn drop(&mut self) {
+        self.threads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<'a> Deref for ThreadsGuard<'a> {
+    type Target = AtomicI32;
+    fn deref(&self) -> &Self::Target {
+        self.threads
+    }
+}
+
+impl<'a> ThreadsGuard<'a> {
+    fn new(threads: &'a AtomicI32) -> (i32, Self) {
+        (threads.fetch_add(1, Ordering::AcqRel), Self { threads })
+    }
 }
 
 fn stage_0(data: &[u8]) -> Option<(VarInt, String, u16, VarInt)> {
@@ -191,9 +215,9 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
     // spectator mode. TODO adjust bitflags for other modes
     conn.write_all(&assemble(
         0x3E,
-        &player_abilities(INVUNERABLE | FLYING | ALLOW_FLYING, 0.05, 0.1),
+        &player_abilities(INVUNERABLE | FLYING | ALLOW_FLYING | CREATIVE, 0.05, 0.1),
     ))?;
-    event!(Level::TRACE, "Sent Player Abilities for Spectator mode");
+    event!(Level::TRACE, "Sent Player Abilities for Creative mode");
     conn.write_all(&assemble(0x67, &set_held_slot(0)))?;
     event!(Level::TRACE, "Set player slot to 0");
     conn.write_all(&assemble(0x83, &update_recipes()))?; // TODO add recipes
@@ -394,7 +418,7 @@ fn handle_client(
     ctx.connected_port = port;
     // Play state
     if next.value() == 2 {
-        let prev = threads.fetch_add(1, Ordering::AcqRel);
+        let (prev, _guard) = ThreadsGuard::new(&threads);
         if prev >= settings.server.max_players {
             threads.fetch_sub(1, Ordering::AcqRel);
             conn.write_all(DISCONNECT).ok()?;

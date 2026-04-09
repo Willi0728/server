@@ -612,9 +612,10 @@ pub fn keep_alive(id: i64) -> Vec<u8> {
 }
 
 pub fn keep_alive_with_packet_id(id: i64, to: &mut impl Write) -> io::Result<()> {
-    let mut buf = [0u8; 9];
-    buf[0] = 0x2b;
-    buf[1..].copy_from_slice(&id.to_be_bytes());
+    let mut buf = [0u8; 10];
+    buf[0] = 0x09;
+    buf[1] = 0x2b;
+    buf[2..].copy_from_slice(&id.to_be_bytes());
     to.write_all(&buf)
 }
 
