@@ -611,6 +611,13 @@ pub fn keep_alive(id: i64) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
 
+pub fn keep_alive_with_packet_id(id: i64, to: &mut impl Write) -> io::Result<()> {
+    let mut buf = [0u8; 9];
+    buf[0] = 0x2b;
+    buf[1..].copy_from_slice(&id.to_be_bytes());
+    to.write_all(&buf)
+}
+
 pub fn consume_bytes<'a>(data: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     if n > data.len() {
         return None;

@@ -20,10 +20,10 @@ pub enum TaskSchedule {
     Once(u64),
 }
 
-pub trait TaskClosure: FnMut(&mut Level) + Send + 'static {}
-impl<T> TaskClosure for T where T: FnMut(&mut Level) + Send + 'static {}
+pub trait TaskClosure: FnMut(&mut Level) + Send + Sync + 'static {}
+impl<T> TaskClosure for T where T: FnMut(&mut Level) + Send + Sync + 'static {}
 
-pub type Task = (Box<dyn FnMut(&mut Level) + Send>, TaskSchedule);
+pub type Task = (Box<dyn FnMut(&mut Level) + Send + Sync>, TaskSchedule);
 
 pub struct Level {
     tasks: Vec<Option<Task>>,
@@ -39,7 +39,7 @@ pub struct LevelChunk {
 
 pub enum LightSection {
     Single(u8),
-    Direct([u8; 2048]),
+    Direct(Box<[u8; 2048]>),
 }
 
 pub struct ChunkSection {
@@ -128,11 +128,7 @@ fn serialize_single_paletted<T: Into<i32>>(value: T) -> Vec<u8> {
     out
 }
 
-fn serialize_indirect_paletted(
-    bits_per_entry: u8,
-    palette: &[VarInt],
-    data: &[u64],
-) -> Vec<u8> {
+fn serialize_indirect_paletted(bits_per_entry: u8, palette: &[VarInt], data: &[u64]) -> Vec<u8> {
     let mut out = vec![bits_per_entry];
     out.extend(palette.serialize());
     out.extend(serialize_long_array(data));
@@ -283,9 +279,7 @@ impl LevelChunk {
         for section in light {
             if !matches!(section, LightSection::Single(0)) {
                 to.extend(2048i32.serialize());
-                section
-                    .write_to(to)
-                    .expect("Vec<u8> writes do not fail");
+                section.write_to(to).expect("Vec<u8> writes do not fail");
             }
         }
     }
@@ -329,7 +323,7 @@ impl LightSection {
     fn write_to<W: Write>(&self, to: &mut W) -> io::Result<()> {
         to.write_all(match self {
             Self::Single(n) => &LIGHT_SECTION[*n as usize],
-            Self::Direct(a) => a,
+            Self::Direct(a) => &**a,
         })
     }
 }
@@ -424,7 +418,12 @@ impl ChunkSection {
         }
     }
 
-    pub fn fill(&mut self, (x1, y1, z1): (u8, u8, u8), (x2, y2, z2): (u8, u8, u8), block_state: u16) {
+    pub fn fill(
+        &mut self,
+        (x1, y1, z1): (u8, u8, u8),
+        (x2, y2, z2): (u8, u8, u8),
+        block_state: u16,
+    ) {
         for x in x1..x2 {
             for y in y1..y2 {
                 for z in z1..z2 {

@@ -1,10 +1,12 @@
 use indoc::indoc;
 use rand::Rng;
 use serde::Deserialize;
+use server::world;
 use server::world::*;
 use server::*;
 use sha2::{Digest, Sha256};
 use std::io;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
     fs,
@@ -142,7 +144,7 @@ fn assemble_0(json: &str) -> Option<Vec<u8>> {
     Some(result)
 }
 
-fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) -> Option<()> {
+fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) -> io::Result<()> {
     let _guard = span!(Level::INFO, "play");
     let w = &settings.world;
     let seed_hash = i64::from_be_bytes(
@@ -179,10 +181,9 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
             w.sea_level,
             w.enforce_secure_chat,
         ),
-    ))
-    .ok()?;
+    ))?;
     event!(Level::TRACE, "Sent Login (play)");
-    conn.write_all(&assemble(0x26, &game_event(13, 0.0))).ok()?;
+    conn.write_all(&assemble(0x26, &game_event(13, 0.0)))?;
     event!(
         Level::TRACE,
         "Sent Game Event 13 (start waiting for level chunks)"
@@ -191,18 +192,15 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
     conn.write_all(&assemble(
         0x3E,
         &player_abilities(INVUNERABLE | FLYING | ALLOW_FLYING, 0.05, 0.1),
-    ))
-    .ok()?;
+    ))?;
     event!(Level::TRACE, "Sent Player Abilities for Spectator mode");
-    conn.write_all(&assemble(0x67, &set_held_slot(0))).ok()?;
+    conn.write_all(&assemble(0x67, &set_held_slot(0)))?;
     event!(Level::TRACE, "Set player slot to 0");
-    conn.write_all(&assemble(0x83, &update_recipes())).ok()?; // TODO add recipes
+    conn.write_all(&assemble(0x83, &update_recipes()))?; // TODO add recipes
     event!(Level::TRACE, "Updated no recipes");
-    conn.write_all(&assemble(0x61, &set_entity_metadata(1))) // TODO also set entity id
-        .ok()?; // TODO add metadata
+    conn.write_all(&assemble(0x61, &set_entity_metadata(1)))?; // TODO add metadata // TODO also set entity id
     event!(Level::TRACE, "Set no metadata for player");
-    conn.write_all(&assemble(0x5C, &set_chunk_cache_center(0, 0)))
-        .ok()?;
+    conn.write_all(&assemble(0x5C, &set_chunk_cache_center(0, 0)))?;
     event!(Level::TRACE, "set center chunk to 0, 0");
     let r = settings.world.view_distance;
     let mut tempbuf = vec![];
@@ -216,40 +214,37 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
     conn.write_all(&assemble(
         0x5F,
         &set_default_spawn_position("minecraft:overworld".to_owned(), (8, -30, 8), 0.0, 0.0), //TODO make this a config
-    ))
-    .ok()?;
+    ))?;
     conn.write_all(&assemble(
         0x46,
         &player_position(0, 8.0, -30.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0),
-    ))
-    .ok()?;
+    ))?;
     event!(Level::TRACE, "Synchronized player position");
-    let _ = conn.read_one().ok()?;
+    let _ = conn.read_one()?;
     event!(Level::TRACE, "Read Teleport Confirm");
 
     event!(
         Level::INFO,
         "{} joined in {:?} ms",
         ctx.name,
-        Instant::now().checked_duration_since(ctx.connected_at)?
+        Instant::now().checked_duration_since(ctx.connected_at)
     );
 
-    conn.write_all(&tempbuf).ok()?;
+    conn.write_all(&tempbuf)?;
 
     loop {
-        if let Some(packet) = conn.read_one().ok()? {
+        if let Some(packet) = conn.read_one()? {
             event!(Level::TRACE, "Recieved packet {}", packet.id.value());
             if packet.id.value() == 12 {
-                conn.write_all(&assemble(0x2B, &keep_alive(rand::rng().next_u64() as i64))) // same length casting
-                    .ok()?;
-                event!(Level::TRACE, "Sent Keep Alive")
+                keep_alive_with_packet_id(rand::rng().next_u64() as i64, &mut conn)?;
+                event!(Level::TRACE, "Sent Keep Alive");
             }
         } else {
             event!(Level::INFO, "Player left");
             break;
         }
     }
-    Some(())
+    Ok(())
 }
 
 fn handle_configuration(
@@ -335,8 +330,7 @@ fn handle_configuration(
         "Client acknowledged finish config, transitioning to Play"
     );
     std::mem::drop(guard);
-    handle_play(conn, settings, ctx); //TODO prop errors
-    Ok(())
+    handle_play(conn, settings, ctx)
 }
 
 fn handle_player(
@@ -376,6 +370,7 @@ fn handle_client(
     settings: Arc<Config>,
     threads: Arc<AtomicI32>,
     mut ctx: PlayerContext,
+    mut world: Arc<RwLock<world::Level>>,
 ) -> Option<()> {
     let status = &settings.status;
     // Handshaking 0 ( Handshake )
@@ -464,6 +459,7 @@ fn handle_client(
 }
 
 fn main() {
+    let program_start = Instant::now();
     tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
         .init();
@@ -484,19 +480,22 @@ fn main() {
             e => {
                 event!(Level::ERROR, "Unknown error reading config file: {e}");
                 return;
-            },
+            }
         },
     };
     let settings = String::from_utf8(settings).expect("Config file contains invalid UTF-8.");
-    let settings: Config =
-        toml::from_str(&settings).expect("Invalid config format. Maybe try deleting or moving config.toml?");
+    let settings: Config = toml::from_str(&settings)
+        .expect("Invalid config format. Maybe try deleting or moving config.toml?");
     let threads = Arc::new(AtomicI32::new(0));
     let listener =
         TcpListener::bind(SocketAddr::new(settings.server.bind, settings.server.port)).unwrap();
     let shared_settings = Arc::new(settings);
+    let world = Arc::new(RwLock::new(world::Level::new()));
+    event!(Level::INFO, "Ready in {:?}", program_start.elapsed());
     for stream in listener.incoming() {
         let thread_settings = Arc::clone(&shared_settings);
         let threads = Arc::clone(&threads);
+        let world = Arc::clone(&world);
         thread::spawn(move || match stream {
             Ok(s) => {
                 let peer = s.peer_addr();
@@ -517,6 +516,7 @@ fn main() {
                     thread_settings,
                     threads.clone(),
                     player_context,
+                    world,
                 )
                 .is_none()
                 {
