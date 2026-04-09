@@ -1,3 +1,5 @@
+use rand::Rng;
+
 use crate::*;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -29,6 +31,7 @@ pub struct Level {
     tasks: Vec<Option<Task>>,
     time: u64,
     chunks: HashMap<(i32, i32), LevelChunk>,
+    seed: i64,
 }
 
 pub struct LevelChunk {
@@ -208,11 +211,26 @@ impl Level {
         self.time += 1;
     }
 
-    pub fn new() -> Self {
+    pub fn get_or_create_chunk(
+        &mut self,
+        (x, z): (i32, i32),
+        generator: &mut dyn FnMut(i32, i32, i64) -> LevelChunk,
+    ) -> &LevelChunk {
+        self.chunks
+            .entry((x, z))
+            .or_insert_with(|| generator(x, z, self.seed))
+    }
+
+    pub fn new(seed: Option<i64>) -> Self {
         Self {
             tasks: vec![],
             time: 0,
             chunks: HashMap::new(),
+            seed: if let Some(seed) = seed {
+                seed
+            } else {
+                rand::rng().next_u64() as i64
+            },
         }
     }
 
@@ -250,6 +268,28 @@ impl LevelChunk {
         }
     }
 
+    pub fn set_block(&mut self, x: u8, y: i32, z: u8, block_state: u16) {
+        if y >= 320 || y < -64 {
+            return;
+        }
+        self.sections[y as usize / 16].set_block(x, (y % 16) as u8, z, block_state)
+    }
+
+    pub fn fill(
+        &mut self,
+        (x1, y1, z1): (u8, i32, u8),
+        (x2, y2, z2): (u8, i32, u8),
+        block_state: u16,
+    ) {
+        for x in x1..x2 {
+            for y in y1..y2 {
+                for z in z1..z2 {
+                    self.set_block(x, y, z, block_state);
+                }
+            }
+        }
+    }
+
     fn light_mask(light: &[LightSection; 26]) -> u64 {
         let mut out = 0u64;
         for (i, section) in light.iter().enumerate() {
@@ -284,11 +324,10 @@ impl LevelChunk {
         }
     }
 
-    fn serialize(&self, x: i32, z: i32) -> Vec<u8> {
+    pub fn serialize(&self, x: i32, z: i32) -> Vec<u8> {
         let mut out = vec![];
         out.extend_from_slice(&x.to_be_bytes());
         out.extend_from_slice(&z.to_be_bytes());
-        out.extend(<[i32]>::serialize(&[])); // heightmaps
         out.extend(<[i32]>::serialize(&[])); // heightmaps
         // byte[]
         let mut data: Vec<u8> = vec![];
@@ -299,12 +338,12 @@ impl LevelChunk {
         }
         out.extend((data.len() as i32).serialize()); // no way chunk data is bigger than i32::MAX bytes...right?
         out.extend(data);
-        out.extend(0i32.serialize()); // no block entities yet
+        out.extend(<[i32]>::serialize(&[])); // no block entities yet
         // Bitset  set 1
         let skyset = Self::light_mask(&self.skylight);
         let blockset = Self::light_mask(&self.blocklight);
-        let empty_skyset = Self::LIGHT_SECTION_MASK ^ skyset;
-        let empty_blockset = Self::LIGHT_SECTION_MASK ^ blockset;
+        let empty_skyset = skyset ^ Self::LIGHT_SECTION_MASK;
+        let empty_blockset = blockset ^ Self::LIGHT_SECTION_MASK;
         Self::write_bitset(&mut out, skyset);
         Self::write_bitset(&mut out, blockset);
         Self::write_bitset(&mut out, empty_skyset);

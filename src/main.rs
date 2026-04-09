@@ -6,7 +6,7 @@ use server::world::*;
 use server::*;
 use sha2::{Digest, Sha256};
 use std::io;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
@@ -40,10 +40,11 @@ const BASE_DATA: &[u8] = indoc! {r#"
     echo_version = false
     motd = "A Minecraft Server"
     [server]
-    bind = "0.0.0.0"
-    port = 25565
+    bind = "0.0.0.0" # Any IPv4 or IPv6 number
+    port = 25565  # Valid values: any number 0-65536, preferably 1024-49151
     max_players = 20
     buffer_size = 65536
+    log_level = "INFO" # Valid values: TRACE, DEBUG, INFO, WARN, ERROR
     [world]
     hardcore = false
     view_distance = 10
@@ -52,7 +53,7 @@ const BASE_DATA: &[u8] = indoc! {r#"
     respawn_screen = true
     limited_crafting = false
     seed = 0
-    default_gamemode = 1
+    default_gamemode = 1 # Values: 0 (Survival), 1 (Creative), 2 (Adventure), 3 (Spectator)
     debug = false
     superflat = true
     portal_cooldown = 300
@@ -102,6 +103,7 @@ struct ServerConfig {
     port: u16,
     max_players: i32,
     buffer_size: usize,
+    log_level: String,
 }
 
 struct PlayerContext {
@@ -168,7 +170,12 @@ fn assemble_0(json: &str) -> Option<Vec<u8>> {
     Some(result)
 }
 
-fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) -> io::Result<()> {
+fn handle_play(
+    mut conn: ConnReader,
+    settings: Arc<Config>,
+    ctx: PlayerContext,
+    level: Arc<RwLock<world::Level>>,
+) -> io::Result<()> {
     let _guard = span!(Level::INFO, "play");
     let w = &settings.world;
     let seed_hash = i64::from_be_bytes(
@@ -228,11 +235,19 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
     event!(Level::TRACE, "set center chunk to 0, 0");
     let r = settings.world.view_distance;
     let mut tempbuf = vec![];
-    let mut chunk = level_chunk_with_light(0, 0);
     for (x, z) in (-r..=r).flat_map(|x| (-r..=r).map(move |z| (x, z))) {
-        chunk[0..4].copy_from_slice(&x.to_be_bytes());
-        chunk[4..8].copy_from_slice(&z.to_be_bytes());
-        tempbuf.extend(assemble(0x2C, &chunk));
+        tempbuf.extend(assemble(
+            0x2C,
+            &level
+                .write()
+                .unwrap()
+                .get_or_create_chunk((x, z), &mut |_x, _z, _seed| {
+                    let mut chunk = LevelChunk::new();
+                    chunk.fill((0, 0, 0), (15, 0, 15), 33);
+                    chunk
+                })
+                .serialize(x, z),
+        ));
         event!(Level::TRACE, "Sent chunk {x}, {z}");
     }
     conn.write_all(&assemble(
@@ -249,9 +264,12 @@ fn handle_play(mut conn: ConnReader, settings: Arc<Config>, ctx: PlayerContext) 
 
     event!(
         Level::INFO,
-        "{} joined in {:?} ms",
+        "{} joined in {}",
         ctx.name,
-        Instant::now().checked_duration_since(ctx.connected_at)
+        Instant::now()
+            .checked_duration_since(ctx.connected_at)
+            .map(|d| format!("{d:?}"))
+            .unwrap_or_else(|| "unknown time".to_string())
     );
 
     conn.write_all(&tempbuf)?;
@@ -275,6 +293,7 @@ fn handle_configuration(
     mut conn: ConnReader,
     settings: Arc<Config>,
     ctx: PlayerContext,
+    level: Arc<RwLock<world::Level>>,
 ) -> io::Result<()> {
     let guard = span!(Level::INFO, "configuration");
     event!(Level::TRACE, "Configuring");
@@ -354,13 +373,14 @@ fn handle_configuration(
         "Client acknowledged finish config, transitioning to Play"
     );
     std::mem::drop(guard);
-    handle_play(conn, settings, ctx)
+    handle_play(conn, settings, ctx, level)
 }
 
 fn handle_player(
     mut conn: ConnReader,
     settings: Arc<Config>,
     mut ctx: PlayerContext,
+    level: Arc<RwLock<world::Level>>,
 ) -> Option<()> {
     let guard = span!(Level::INFO, "login");
     event!(Level::DEBUG, "Logging in");
@@ -386,7 +406,7 @@ fn handle_player(
     conn.read_one().ok()??;
     event!(Level::DEBUG, "Read Login Acknowledge");
     std::mem::drop(guard);
-    handle_configuration(conn, settings, ctx).ok()
+    handle_configuration(conn, settings, ctx, level).ok()
 }
 
 fn handle_client(
@@ -394,7 +414,7 @@ fn handle_client(
     settings: Arc<Config>,
     threads: Arc<AtomicI32>,
     mut ctx: PlayerContext,
-    mut world: Arc<RwLock<world::Level>>,
+    level: Arc<RwLock<world::Level>>,
 ) -> Option<()> {
     let status = &settings.status;
     // Handshaking 0 ( Handshake )
@@ -420,12 +440,10 @@ fn handle_client(
     if next.value() == 2 {
         let (prev, _guard) = ThreadsGuard::new(&threads);
         if prev >= settings.server.max_players {
-            threads.fetch_sub(1, Ordering::AcqRel);
             conn.write_all(DISCONNECT).ok()?;
             return None;
         }
-        let res = handle_player(conn, settings, ctx);
-        threads.fetch_sub(1, Ordering::AcqRel);
+        let res = handle_player(conn, settings, ctx, level);
         return res;
     }
     event!(Level::DEBUG, "Pinging");
@@ -484,37 +502,57 @@ fn handle_client(
 
 fn main() {
     let program_start = Instant::now();
-    tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
-        .init();
     let settings = match fs::read(CONFIG_FILE) {
         Ok(s) => s,
         Err(e) => match e.kind() {
             ErrorKind::NotFound => {
                 if let Err(e) = fs::write(CONFIG_FILE, BASE_DATA) {
-                    event!(Level::ERROR, "Could not write default config to file: {e}");
-                    return;
+                    panic!("Could not write default config to file: {e}")
                 }
                 BASE_DATA.to_vec()
             }
             ErrorKind::PermissionDenied => {
-                event!(Level::ERROR, "Permission denied reading config file.");
-                return;
+                panic!("Permission denied reading config file.")
             }
             e => {
-                event!(Level::ERROR, "Unknown error reading config file: {e}");
-                return;
+                panic!("Unknown error reading config file: {e}")
             }
         },
     };
     let settings = String::from_utf8(settings).expect("Config file contains invalid UTF-8.");
-    let settings: Config = toml::from_str(&settings)
-        .expect("Invalid config format. Maybe try deleting or moving config.toml?");
+    let settings: Config = match toml::from_str(&settings) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Invalid config format.");
+            eprintln!("Error message: {}", e.message());
+            if e.message().starts_with("missing field") {
+                eprintln!("To resolve this error, add the missing field in your configuration.")
+            }
+            eprintln!("To generate a new, clean config, delete or rename config.toml.");
+            panic!()
+        }
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(match &*settings.server.log_level.to_ascii_uppercase() {
+            "TRACE" => Level::TRACE,
+            "DEBUG" => Level::DEBUG,
+            "INFO" => Level::INFO,
+            "WARN" => Level::WARN,
+            "ERROR" => Level::ERROR,
+            _ => {
+                eprintln!(
+                    "WARNING: Log level was not set to one of TRACE, DEBUG, INFO, WARN, ERROR"
+                );
+                eprintln!("WARNING: Defaulting to INFO");
+                Level::INFO
+            }
+        })
+        .init();
     let threads = Arc::new(AtomicI32::new(0));
     let listener =
         TcpListener::bind(SocketAddr::new(settings.server.bind, settings.server.port)).unwrap();
     let shared_settings = Arc::new(settings);
-    let world = Arc::new(RwLock::new(world::Level::new()));
+    let world = Arc::new(RwLock::new(world::Level::new(None)));
     event!(Level::INFO, "Ready in {:?}", program_start.elapsed());
     for stream in listener.incoming() {
         let thread_settings = Arc::clone(&shared_settings);
