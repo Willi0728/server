@@ -76,22 +76,7 @@ impl Serialize for BlockPalettedContainer {
                 bits_per_entry,
                 palette,
                 data,
-            } => {
-                let wire_bits_per_entry = (*bits_per_entry).max(4);
-                let wire_data = if wire_bits_per_entry == *bits_per_entry {
-                    data.clone()
-                } else {
-                    ChunkSection::repack_packed_data(data, *bits_per_entry, wire_bits_per_entry)
-                };
-                serialize_indirect_paletted(
-                    wire_bits_per_entry,
-                    &palette
-                        .iter()
-                        .map(|&entry| VarInt::new(entry as i32))
-                        .collect::<Vec<_>>(),
-                    &wire_data,
-                )
-            }
+            } => serialize_block_indirect_paletted(*bits_per_entry, palette, data),
             Self::Direct(data) => serialize_direct_paletted(
                 15,
                 &data.iter().map(|&entry| entry as u64).collect::<Vec<_>>(),
@@ -135,21 +120,43 @@ fn serialize_single_paletted<T: Into<i32>>(value: T) -> Vec<u8> {
     out
 }
 
+fn serialize_block_indirect_paletted(
+    bits_per_entry: u8,
+    palette: &[u16],
+    data: &[u64],
+) -> Vec<u8> {
+    let wire_bits_per_entry = bits_per_entry.max(4);
+    let wire_data = if wire_bits_per_entry == bits_per_entry {
+        data.to_vec()
+    } else {
+        ChunkSection::repack_packed_data(data, bits_per_entry, wire_bits_per_entry)
+    };
+
+    serialize_indirect_paletted(
+        wire_bits_per_entry,
+        &palette
+            .iter()
+            .map(|&entry| VarInt::new(entry as i32))
+            .collect::<Vec<_>>(),
+        &wire_data,
+    )
+}
+
 fn serialize_indirect_paletted(bits_per_entry: u8, palette: &[VarInt], data: &[u64]) -> Vec<u8> {
     let mut out = vec![bits_per_entry];
     out.extend(palette.serialize());
-    out.extend(serialize_long_array(data));
+    out.extend(serialize_fixed_long_array(data));
     out
 }
 
 fn serialize_direct_paletted(bits_per_entry: u8, values: &[u64]) -> Vec<u8> {
     let mut out = vec![bits_per_entry];
-    out.extend(serialize_long_array(&pack_entries(values, bits_per_entry)));
+    out.extend(serialize_fixed_long_array(&pack_entries(values, bits_per_entry)));
     out
 }
 
-fn serialize_long_array(data: &[u64]) -> Vec<u8> {
-    let mut out = VarInt::new(data.len() as i32).serialize();
+fn serialize_fixed_long_array(data: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() * size_of::<u64>());
     for word in data {
         out.extend_from_slice(&word.to_be_bytes());
     }
@@ -276,7 +283,9 @@ impl LevelChunk {
         if y >= 320 || y < -64 {
             return;
         }
-        self.sections[y as usize / 16].set_block(x, (y % 16) as u8, z, block_state)
+        let section_index = ((y + 64) / 16) as usize;
+        let section_y = y.rem_euclid(16) as u8;
+        self.sections[section_index].set_block(x, section_y, z, block_state)
     }
 
     pub fn fill(
