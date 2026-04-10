@@ -243,13 +243,20 @@ fn handle_play(
                 .unwrap()
                 .get_or_create_chunk((x, z), &mut |_x, _z, _seed| {
                     let mut chunk = LevelChunk::new();
-                    chunk.fill((0, 0, 0), (15, 0, 15), 33);
+                    chunk.fill((0, 0, 0), (16, 1, 16), 33);
                     chunk
                 })
                 .serialize(x, z),
         ));
         event!(Level::TRACE, "Sent chunk {x}, {z}");
     }
+    println!(
+        "{:?}",
+        &level
+            .write()
+            .unwrap()
+            .get_or_create_chunk((0, 0), &mut |_, _, _| LevelChunk::new())
+    );
     conn.write_all(&assemble(
         0x5F,
         &set_default_spawn_position("minecraft:overworld".to_owned(), (8, -30, 8), 0.0, 0.0), //TODO make this a config

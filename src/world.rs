@@ -34,23 +34,27 @@ pub struct Level {
     seed: i64,
 }
 
+#[derive(Debug)]
 pub struct LevelChunk {
     sections: [ChunkSection; 24],
     skylight: [LightSection; 26],
     blocklight: [LightSection; 26],
 }
 
+#[derive(Debug)]
 pub enum LightSection {
     Single(u8),
     Direct(Box<[u8; 2048]>),
 }
 
+#[derive(Debug)]
 pub struct ChunkSection {
     block_count: u16,
     block_states: BlockPalettedContainer,
     biomes: BiomePalettedContainer,
 }
 
+#[derive(Debug)]
 pub enum PalettedContainer<T> {
     Single(T),
     Indirect {

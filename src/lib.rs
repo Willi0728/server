@@ -619,6 +619,38 @@ pub fn keep_alive_with_packet_id(id: i64, to: &mut impl Write) -> io::Result<()>
     to.write_all(&buf)
 }
 
+pub fn decode_player_action(data: &[u8]) -> Result<(i32, (i32, i16, i32), u8, i32), String> {
+    const ERROR: &str =
+        "Failed to decode packet serverbound/minecraft:player_action: Not enough bytes in buffer";
+    let (read, status) = VarInt::decode_strict(data);
+    let status = status.ok_or_else(|| "VarInt too big".to_string())?;
+    let position_long = i64::from_be_bytes(
+        data.get(read..read + 8)
+            .ok_or_else(|| ERROR.to_string())?
+            .try_into()
+            .ok()
+            .ok_or_else(|| "Unknown error".to_string())?,
+    );
+    let x = position_long >> 38;
+    let y = position_long << 52 >> 52;
+    let z = position_long << 26 >> 38;
+    let face = u8::from_be_bytes(
+        data.get(read + 8..read + 9)
+            .ok_or_else(|| ERROR.to_string())?
+            .try_into()
+            .ok()
+            .ok_or_else(|| "Unknown error".to_string())?,
+    );
+    let (_, seq) = VarInt::decode_strict(data.get(read + 9..).ok_or_else(|| ERROR.to_string())?);
+    let seq = seq.ok_or_else(|| "VarInt too big".to_string())?;
+    Ok((
+        status.value(),
+        (x as i32, y as i16, z as i32),
+        face,
+        seq.value(),
+    ))
+}
+
 pub fn consume_bytes<'a>(data: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     if n > data.len() {
         return None;
