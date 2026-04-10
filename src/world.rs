@@ -120,11 +120,7 @@ fn serialize_single_paletted<T: Into<i32>>(value: T) -> Vec<u8> {
     out
 }
 
-fn serialize_block_indirect_paletted(
-    bits_per_entry: u8,
-    palette: &[u16],
-    data: &[u64],
-) -> Vec<u8> {
+fn serialize_block_indirect_paletted(bits_per_entry: u8, palette: &[u16], data: &[u64]) -> Vec<u8> {
     let wire_bits_per_entry = bits_per_entry.max(4);
     let wire_data = if wire_bits_per_entry == bits_per_entry {
         data.to_vec()
@@ -151,7 +147,10 @@ fn serialize_indirect_paletted(bits_per_entry: u8, palette: &[VarInt], data: &[u
 
 fn serialize_direct_paletted(bits_per_entry: u8, values: &[u64]) -> Vec<u8> {
     let mut out = vec![bits_per_entry];
-    out.extend(serialize_fixed_long_array(&pack_entries(values, bits_per_entry)));
+    out.extend(serialize_fixed_long_array(&pack_entries(
+        values,
+        bits_per_entry,
+    )));
     out
 }
 
@@ -263,6 +262,14 @@ impl Level {
 
     pub fn serialize(&self, x: i32, z: i32) -> Option<Vec<u8>> {
         Some(self.chunks.get(&(x, z))?.serialize(x, z))
+    }
+
+    pub fn get_chunk(&self, x: i32, z: i32) -> Option<&LevelChunk> {
+        self.chunks.get(&(x, z))
+    }
+
+    pub fn get_chunk_mut(&mut self, x: i32, z: i32) -> Option<&mut LevelChunk> {
+        self.chunks.get_mut(&(x, z))
     }
 }
 

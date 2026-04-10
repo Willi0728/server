@@ -243,20 +243,13 @@ fn handle_play(
                 .unwrap()
                 .get_or_create_chunk((x, z), &mut |_x, _z, _seed| {
                     let mut chunk = LevelChunk::new();
-                    chunk.fill((0, 0, 0), (16, 1, 16), 33);
+                    chunk.fill((0, -64, 0), (16, -32, 16), 1);
                     chunk
                 })
                 .serialize(x, z),
         ));
         event!(Level::TRACE, "Sent chunk {x}, {z}");
     }
-    println!(
-        "{:?}",
-        &level
-            .write()
-            .unwrap()
-            .get_or_create_chunk((0, 0), &mut |_, _, _| LevelChunk::new())
-    );
     conn.write_all(&assemble(
         0x5F,
         &set_default_spawn_position("minecraft:overworld".to_owned(), (8, -30, 8), 0.0, 0.0), //TODO make this a config
@@ -283,13 +276,38 @@ fn handle_play(
 
     loop {
         if let Some(packet) = conn.read_one()? {
-            event!(Level::TRACE, "Recieved packet {}", packet.id.value());
-            if packet.id.value() == 12 {
-                keep_alive_with_packet_id(rand::rng().next_u64() as i64, &mut conn)?;
-                event!(Level::TRACE, "Sent Keep Alive");
+            match packet.id.value() {
+                0x0C => {
+                    keep_alive_with_packet_id(rand::rng().next_u64() as i64, &mut conn)?;
+                    event!(Level::TRACE, "Sent Keep Alive");
+                }
+                0x28 => {
+                    let (status, (x, y, z), _face, _sequence) =
+                        decode_player_action(&packet.data).map_err(|e| io::Error::other(e))?;
+                    match status {
+                        0 | 2 => {
+                            level
+                                .write()
+                                .unwrap()
+                                .get_chunk_mut(x / 16, z / 16)
+                                .ok_or(io::Error::other("Mined block in unloaded chunk"))?
+                                .set_block(
+                                    x.rem_euclid(16) as u8,
+                                    y as i32,
+                                    z.rem_euclid(16) as u8,
+                                    0,
+                                );
+                            event!(Level::INFO, "{} mined block at {x} {y} {z}", ctx.name);
+                        }
+                        id => event!(Level::WARN, "Mining status {id} not implemented yet"),
+                    }
+                }
+                id => {
+                    event!(Level::TRACE, "Recieved unknown packet {id}");
+                }
             }
         } else {
-            event!(Level::INFO, "Player left");
+            event!(Level::INFO, "{} left", ctx.name);
             break;
         }
     }
