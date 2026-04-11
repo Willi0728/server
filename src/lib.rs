@@ -620,35 +620,97 @@ pub fn keep_alive_with_packet_id(id: i64, to: &mut impl Write) -> io::Result<()>
 }
 
 pub fn decode_player_action(data: &[u8]) -> Result<(i32, (i32, i16, i32), u8, i32), String> {
-    const ERROR: &str =
-        "Failed to decode packet serverbound/minecraft:player_action: Not enough bytes in buffer";
     let (read, status) = VarInt::decode_strict(data);
-    let status = status.ok_or_else(|| "VarInt too big".to_string())?;
+    let status = status.ok_or_else(|| "VarInt too big")?;
     let position_long = i64::from_be_bytes(
         data.get(read..read + 8)
-            .ok_or_else(|| ERROR.to_string())?
+            .ok_or_else(|| packet_too_short("player_action"))?
             .try_into()
             .ok()
-            .ok_or_else(|| "Unknown error".to_string())?,
+            .ok_or_else(|| "Unknown error")?,
     );
     let x = position_long >> 38;
     let y = position_long << 52 >> 52;
     let z = position_long << 26 >> 38;
-    let face = u8::from_be_bytes(
-        data.get(read + 8..read + 9)
-            .ok_or_else(|| ERROR.to_string())?
-            .try_into()
-            .ok()
-            .ok_or_else(|| "Unknown error".to_string())?,
+    let face = *data.get(read + 8).ok_or_else(|| "Unknown error")?;
+    let (_, seq) = VarInt::decode_strict(
+        data.get(read + 9..)
+            .ok_or_else(|| packet_too_short("player_action"))?,
     );
-    let (_, seq) = VarInt::decode_strict(data.get(read + 9..).ok_or_else(|| ERROR.to_string())?);
-    let seq = seq.ok_or_else(|| "VarInt too big".to_string())?;
+    let seq = seq.ok_or_else(|| "VarInt too big")?;
     Ok((
         status.value(),
         (x as i32, y as i16, z as i32),
         face,
         seq.value(),
     ))
+}
+
+pub fn decode_use_item_on(
+    data: &[u8],
+) -> Result<(i32, (i32, i16, i32), i32, f32, f32, f32, bool, bool, i32), String> {
+    let (read, hand) = VarInt::decode_strict(data);
+    let hand = hand.ok_or_else(|| packet_too_short("use_item_on"))?;
+    let (x, y, z) = next_position(data, read, "use_item_on")?;
+    let (read_temp, face) = VarInt::decode_strict(
+        data.get(read..)
+            .ok_or_else(|| packet_too_short("use_item_on"))?,
+    );
+    let read = read + 8 + read_temp;
+    let face = face.ok_or_else(|| packet_too_short("use_item_on"))?;
+    fn decode_float(data: &[u8], cursor: usize) -> Result<f32, String> {
+        Ok(f32::from_be_bytes(
+            data.get(cursor..cursor + 4)
+                .ok_or_else(|| packet_too_short("use_item_on"))?
+                .try_into()
+                .map_err(|_| "Unknown error")?,
+        ))
+    }
+    let curposx = decode_float(data, read)?;
+    let curposy = decode_float(data, read + 4)?;
+    let curposz = decode_float(data, read + 8)?;
+    let inside = *data
+        .get(read + 9)
+        .ok_or_else(|| packet_too_short("use_item_on"))?
+        != 0;
+    let border_hit = *data
+        .get(read + 10)
+        .ok_or_else(|| packet_too_short("use_item_on"))?
+        != 0;
+    let (_, seq) = VarInt::decode_strict(
+        data.get(read + 11..)
+            .ok_or_else(|| packet_too_short("use_item_on"))?,
+    );
+    let seq = seq.ok_or_else(|| "VarInt too big")?;
+    Ok((
+        hand.value(),
+        (x, y, z),
+        face.value(),
+        curposx,
+        curposy,
+        curposz,
+        inside,
+        border_hit,
+        seq.value(),
+    ))
+}
+
+pub fn packet_too_short(packet: &str) -> String {
+    format!("Failed to decode packet serverbound/minecraft:{packet}: Not enough bytes in buffer")
+        .to_string()
+}
+
+pub fn next_position(data: &[u8], cursor: usize, packet: &str) -> Result<(i32, i16, i32), String> {
+    let position_long = i64::from_be_bytes(
+        data.get(cursor..cursor + 8)
+            .ok_or_else(|| packet_too_short(packet).to_string())?
+            .try_into()
+            .map_err(|_| "Unknown error".to_string())?,
+    );
+    let x = position_long >> 38;
+    let y = position_long << 52 >> 52;
+    let z = position_long << 26 >> 38;
+    Ok((x as i32, y as i16, z as i32))
 }
 
 pub fn consume_bytes<'a>(data: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {

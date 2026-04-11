@@ -273,7 +273,6 @@ fn handle_play(
     );
 
     conn.write_all(&tempbuf)?;
-
     loop {
         if let Some(packet) = conn.read_one()? {
             match packet.id.value() {
@@ -301,6 +300,27 @@ fn handle_play(
                         }
                         id => event!(Level::WARN, "Mining status {id} not implemented yet"),
                     }
+                }
+                0x3F => {
+                    let (hand, (x, y, z), face, cx, cy, cz, inside, hit, seq) =
+                        decode_use_item_on(&packet.data).map_err(|s| io::Error::other(s))?;
+                    let (bx, by, bz) = match face {
+                        0 => (x, y - 1, z),
+                        1 => (x, y + 1, z),
+                        2 => (x, y, z - 1),
+                        3 => (x, y, z + 1),
+                        4 => (x - 1, y, z),
+                        5 => (x + 1, y, z),
+                        _ => {
+                            event!(
+                                Level::ERROR,
+                                "Invalid Face for VarInt Enum during Use Item On"
+                            );
+                            return Err(io::Error::other(
+                                "Invalid Face for VarInt Enum during Use Item On",
+                            ));
+                        }
+                    };
                 }
                 id => {
                     event!(Level::TRACE, "Recieved unknown packet {id}");
