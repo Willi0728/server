@@ -1,7 +1,11 @@
 pub mod world;
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use bytes::{Buf, Bytes, BytesMut};
+use std::io::{self, Write};
+use std::marker::Unpin;
+use std::num::NonZeroU32;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{Decoder, Encoder};
 
 pub trait Serialize {
     fn serialize(&self) -> Vec<u8>;
@@ -22,94 +26,61 @@ pub enum DecodeResult {
     Err,
 }
 
-pub struct ConnReader {
-    stream: TcpStream,
-    buf: Vec<u8>,
-    filled: usize,
+pub struct MCCodec;
+
+impl Decoder for MCCodec {
+    type Item = RawPacket;
+    type Error = io::Error;
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // check if enough bytes for VarInt?
+        let (read, len) = VarInt::decode(src);
+        let len = match len {
+            DecodeResult::Err | DecodeResult::Incomplete(_) => return Ok(None),
+            DecodeResult::Ok(n) => n,
+        };
+        if src.len() < read + len.value() as usize {
+            return Ok(None);
+        }
+        ////////////// we don't use return Ok(None) after here ////////////////////////////////////
+        src.advance(read); // advance length of packet length
+        let (read, id) = VarInt::decode(src);
+        src.advance(read); // advance packet ID
+        let id = match id {
+            DecodeResult::Err => VarInt::new(0),
+            DecodeResult::Ok(n) => n,
+            DecodeResult::Incomplete(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing packet ID",
+                ));
+            }
+        };
+        Ok(Some(RawPacket {
+            length: len,
+            id,
+            data: src.split_to(len.value() as usize - read).to_vec(),
+        })) //TODO make RawPacket store BytesMut
+    }
 }
 
-impl ConnReader {
-    pub fn new(stream: TcpStream, capacity: usize) -> Self {
-        Self {
-            stream,
-            buf: vec![0u8; capacity],
-            filled: 0,
-        }
-    }
-    pub fn resize(&mut self, new_size: usize) -> Option<()> {
-        if new_size < self.filled {
-            None
-        } else {
-            let data = std::mem::replace(&mut self.buf, Vec::with_capacity(new_size));
-            self.buf.extend(data);
-            Some(())
-        }
-    }
-    pub fn read(&mut self) -> io::Result<usize> {
-        let n = self.stream.read(&mut self.buf[self.filled..])?;
-        self.filled += n;
-        Ok(n)
-    }
-    pub fn next_packet(&mut self) -> Option<RawPacket> {
-        if !Self::has_packet(&self.buf[..self.filled]) {
-            return None;
-        }
-        let (res, read) = RawPacket::next_packet(self.buf[..self.filled].to_vec());
-        self.buf.copy_within(read..self.filled, 0);
-        self.filled -= read;
-        res
-    }
-    pub fn read_at_least(&mut self, n: usize) -> io::Result<()> {
-        while self.filled < n {
-            if self.read()? == 0 {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-            }
-        }
+impl Encoder<(i32, Bytes)> for MCCodec {
+    type Error = io::Error;
+    fn encode(&mut self, (id, data): (i32, Bytes), dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let id_varint = id.serialize();
+        dst.extend(((data.len() + id_varint.len()) as i32).serialize()); //TODO make a serialize_into or something
+        dst.extend(id_varint); //TODO i really don't want to do this now
+        dst.extend(data); //TODO so just do it later
         Ok(())
-    }
-    pub fn read_one(&mut self) -> std::io::Result<Option<RawPacket>> {
-        loop {
-            if let Some(p) = self.next_packet() {
-                return Ok(Some(p));
-            }
-            if self.read()? == 0 {
-                return Ok(None);
-            }
-        }
-    }
-    pub fn get_buffer(&self) -> &[u8] {
-        &self.buf[..self.filled]
-    }
-    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
-        self.stream.write_all(data)
-    }
-    pub fn inner_mut(&mut self) -> &mut TcpStream {
-        &mut self.stream
-    }
-    fn has_packet(data: &[u8]) -> bool {
-        let (read, res) = VarInt::decode_loose(data);
-        data.len() - read >= res.value() as usize
-        // no 16 bit computers exist today; usize is at least 32 bits. Casting from 32 to >32 bits is safe.
-    }
-}
-
-impl Write for ConnReader {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner_mut().write(buf)
-    }
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.inner_mut().write_all(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner_mut().flush()
     }
 }
 
 impl VarInt {
+    #[inline]
     pub fn new(value: i32) -> Self {
         Self(value)
     }
 
+    #[inline]
     pub fn value(&self) -> i32 {
         self.0
     }
@@ -148,6 +119,10 @@ impl VarInt {
     ///
     /// It will not return an Incomplete if the data fits in an i32, even if there
     /// is more data available.
+    ///
+    /// Ok(n): the VarInt was decoded successfully
+    /// Incomplete(n): The last bit was a continuation bit, and we need more data
+    /// Err: The buffer was empty
     pub fn decode(data: &[u8]) -> (usize, DecodeResult) {
         use self::DecodeResult::*;
         let mut collector = 0;
@@ -611,12 +586,15 @@ pub fn keep_alive(id: i64) -> Vec<u8> {
     id.to_be_bytes().to_vec()
 }
 
-pub fn keep_alive_with_packet_id(id: i64, to: &mut impl Write) -> io::Result<()> {
+pub async fn keep_alive_with_packet_id(
+    id: i64,
+    to: &mut (impl AsyncWriteExt + Unpin),
+) -> io::Result<()> {
     let mut buf = [0u8; 10];
     buf[0] = 0x09;
     buf[1] = 0x2b;
     buf[2..].copy_from_slice(&id.to_be_bytes());
-    to.write_all(&buf)
+    to.write_all(&buf).await
 }
 
 pub fn decode_player_action(data: &[u8]) -> Result<(i32, (i32, i16, i32), u8, i32), String> {
@@ -653,7 +631,7 @@ pub fn decode_use_item_on(
     let hand = hand.ok_or_else(|| packet_too_short("use_item_on"))?;
     let (x, y, z) = next_position(data, read, "use_item_on")?;
     let (read_temp, face) = VarInt::decode_strict(
-        data.get(read..)
+        data.get(read + 8..)
             .ok_or_else(|| packet_too_short("use_item_on"))?,
     );
     let read = read + 8 + read_temp;
@@ -670,15 +648,15 @@ pub fn decode_use_item_on(
     let curposy = decode_float(data, read + 4)?;
     let curposz = decode_float(data, read + 8)?;
     let inside = *data
-        .get(read + 9)
+        .get(read + 12)
         .ok_or_else(|| packet_too_short("use_item_on"))?
         != 0;
     let border_hit = *data
-        .get(read + 10)
+        .get(read + 13)
         .ok_or_else(|| packet_too_short("use_item_on"))?
         != 0;
     let (_, seq) = VarInt::decode_strict(
-        data.get(read + 11..)
+        data.get(read + 14..)
             .ok_or_else(|| packet_too_short("use_item_on"))?,
     );
     let seq = seq.ok_or_else(|| "VarInt too big")?;
@@ -692,6 +670,60 @@ pub fn decode_use_item_on(
         inside,
         border_hit,
         seq.value(),
+    ))
+}
+
+pub struct SlotFormat {
+    pub count: NonZeroU32,
+    pub id: i32,
+    pub components_to_add: Vec<(i32, Vec<u8>)>,
+    pub components_to_remove: Vec<i32>,
+}
+
+pub fn decode_slot(data: &[u8], packet: &str) -> Result<Option<SlotFormat>, String> {
+    let more_bytes = packet_too_short(packet);
+    let (read, count) = VarInt::decode_strict(data);
+    let mut cursor = read;
+    let count = count.ok_or("VarInt too big")?.value() as u32;
+    if count == 0 {
+        return Ok(None);
+    }
+    let (read, id) = VarInt::decode_strict(data.get(cursor..).ok_or(&more_bytes)?);
+    cursor += read;
+    let id = id.ok_or("VarInt too big")?;
+    let (read, num_add) = VarInt::decode_strict(data.get(cursor..).ok_or(&more_bytes)?);
+    cursor += read;
+    let _num_add = num_add.ok_or("VarInt too big")?;
+    let (_read, num_remove) = VarInt::decode_strict(data.get(cursor..).ok_or(&more_bytes)?);
+    // cursor += read;
+    let _num_remove = num_remove.ok_or("VarInt too big")?;
+    let add: Vec<(i32, Vec<u8>)> = vec![];
+    // for _ in 0..num_add.value() {
+    //     let (read, component_type) = VarInt::decode_strict(data.get(cursor..).ok_or(&more_bytes)?);
+    //     cursor += read;
+    //     let component_type = component_type.ok_or("VarInt too big")?;
+    //     //TODO determine lengths and decode components
+    // }
+    //TODO do the remove
+    let remove: Vec<i32> = vec![];
+    Ok(Some(SlotFormat {
+        count: NonZeroU32::new(count).unwrap(),
+        id: id.value(),
+        components_to_add: add,
+        components_to_remove: remove,
+    }))
+}
+
+pub fn decode_set_creative_mode_slot(data: &[u8]) -> Result<(i16, Option<SlotFormat>), String> {
+    let more_bytes = packet_too_short("set_creative_mode_slot");
+    Ok((
+        i16::from_be_bytes(
+            data.get(0..2)
+                .ok_or(&more_bytes)?
+                .try_into()
+                .map_err(|_| "Unknown error")?,
+        ),
+        decode_slot(data.get(2..).ok_or(more_bytes)?, "set_creative_mode_slot")?,
     ))
 }
 
@@ -740,23 +772,6 @@ pub fn assemble_string(string: &str) -> Option<Vec<u8>> {
     let mut strlen = VarInt::new(string.len().try_into().ok()?).encode();
     strlen.extend_from_slice(string.as_bytes());
     Some(strlen)
-}
-
-pub fn read_until_packet<'a>(
-    stream: &mut TcpStream,
-    buf: &'a mut [u8],
-    leftovers: usize,
-) -> Option<(RawPacket, usize)> {
-    let mut n = leftovers;
-    while let (None, _) = RawPacket::next_packet(buf[..n].to_vec()) {
-        let read = stream.read(&mut buf[n..]).ok()?;
-        if read == 0 {
-            return None;
-        }
-        n += read;
-    }
-    let (packet, consumed) = RawPacket::next_packet(buf.to_vec());
-    Some((packet?, n - consumed))
 }
 
 pub fn assemble(id: i32, data: &[u8]) -> Vec<u8> {
