@@ -1,28 +1,35 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use indoc::indoc;
+use notify;
+use notify::{Event, RecursiveMode, Watcher};
 use rand::Rng;
 use serde::Deserialize;
-use server::world;
-use server::world::*;
-use server::*;
+use server::{
+    self,
+    world::{self, *},
+    *,
+};
 use sha2::{Digest, Sha256};
-use std::io;
-use std::ops::Deref;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 use std::{
     fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    ops::Deref,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicI32, Ordering},
+    },
     time::Instant,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use toml;
-use tracing::{Level, event, info, warn};
+use tracing::{Level, error, event, info, warn};
 
 const DISCONNECT: &[u8] = &[
     0x21, 0x00, 0x1F, 0x7B, 0x22, 0x74, 0x65, 0x78, 0x74, 0x22, 0x3A, 0x20, 0x22, 0x54, 0x68, 0x65,
@@ -37,6 +44,7 @@ const BASE_DATA: &[u8] = indoc! {r#"
     version_string = "1.21.11"
     echo_version = false
     motd = "A Minecraft Server"
+    ping_offset = 0 # adds this much to their real ping. Doesn't affect gameplay
     [server]
     bind = "0.0.0.0" # Any IPv4 or IPv6 number
     port = 25565  # Valid values: any number 0-65536, preferably 1024-49151
@@ -95,6 +103,7 @@ struct StatusConfig {
     version_string: String,
     echo_version: bool,
     motd: String,
+    ping_offset: u64,
 }
 
 #[derive(Deserialize)]
@@ -169,11 +178,11 @@ fn login_success(name: &str, uuid: u128, properties: i32) -> Option<Vec<u8>> {
 
 async fn handle_play(
     mut conn: Framed<TcpStream, MCCodec>,
-    settings: Arc<Config>,
+    settings: Arc<ArcSwap<Config>>,
     ctx: PlayerContext,
     level: Arc<RwLock<world::Level>>,
 ) -> io::Result<()> {
-    let w = &settings.world;
+    let w = &settings.load().world;
     let seed_hash = i64::from_be_bytes(
         Sha256::digest(w.seed.to_be_bytes())[..8]
             .try_into()
@@ -190,7 +199,7 @@ async fn handle_play(
                 "minecraft:the_nether".into(),
                 "minecraft:the_end".into(),
             ],
-            settings.server.max_players,
+            settings.load().server.max_players,
             w.view_distance,
             w.simulation_distance,
             w.reduced_debug_info,
@@ -237,7 +246,7 @@ async fn handle_play(
     conn.send((0x5C, Bytes::from(set_chunk_cache_center(0, 0))))
         .await?;
     event!(Level::TRACE, "set center chunk to 0, 0");
-    let r = settings.world.view_distance;
+    let r = settings.load().world.view_distance;
     let mut tempbuf = vec![];
     for (x, z) in (-r..=r).flat_map(|x| (-r..=r).map(move |z| (x, z))) {
         tempbuf.extend(assemble(
@@ -269,11 +278,10 @@ async fn handle_play(
     ))
     .await?;
     event!(Level::TRACE, "Synchronized player position");
-    let warn = conn.next().await.is_none();
     event!(
         Level::TRACE,
         "Read Teleport Confirm{}",
-        if warn {
+        if conn.next().await.is_none() {
             ", but probably got an EOF"
         } else {
             ""
@@ -429,7 +437,7 @@ async fn handle_play(
 
 async fn handle_configuration(
     mut conn: Framed<TcpStream, MCCodec>,
-    settings: Arc<Config>,
+    settings: Arc<ArcSwap<Config>>,
     ctx: PlayerContext,
     level: Arc<RwLock<world::Level>>,
 ) -> io::Result<()> {
@@ -514,7 +522,7 @@ async fn handle_configuration(
 
 async fn handle_player(
     mut conn: Framed<TcpStream, MCCodec>,
-    settings: Arc<Config>,
+    settings: Arc<ArcSwap<Config>>,
     mut ctx: PlayerContext,
     level: Arc<RwLock<world::Level>>,
 ) -> Option<()> {
@@ -546,12 +554,12 @@ async fn handle_player(
 
 async fn handle_client(
     conn: TcpStream,
-    settings: Arc<Config>,
+    settings: Arc<ArcSwap<Config>>,
     threads: Arc<AtomicI32>,
     mut ctx: PlayerContext,
     level: Arc<RwLock<world::Level>>,
 ) -> Option<()> {
-    let status = &settings.status;
+    let status = &settings.load().status;
     // Handshaking 0 ( Handshake )
     let mut framed = Framed::new(conn, MCCodec);
     let handshake = framed.next().await.and_then(Result::ok)?;
@@ -562,7 +570,7 @@ async fn handle_client(
     // Play state
     if next.value() == 2 {
         let (prev, _guard) = ThreadsGuard::new(&threads);
-        if prev >= settings.server.max_players {
+        if prev >= settings.load().server.max_players {
             return framed.into_inner().write_all(DISCONNECT).await.ok();
         }
         return handle_player(framed, settings, ctx, level).await;
@@ -609,7 +617,7 @@ async fn handle_client(
         } else {
             status.protocol_version
         },
-        settings.server.max_players,
+        settings.load().server.max_players,
         threads.load(Ordering::Acquire),
         status.motd, // limitation: breaks if has quote or \
     ))?;
@@ -619,19 +627,42 @@ async fn handle_client(
         .ok()?;
     // Status 1 ( Ping Request )
     let n = framed.next().await.and_then(Result::ok)?;
+    // ping offset
+    tokio::time::sleep(Duration::from_millis(settings.load().status.ping_offset)).await;
     // Status 1 ( Ping Response )
     framed.send((0x01, Bytes::from(n.data))).await.ok()?;
     Some(())
 }
 
+fn decode_config(settings: &str) -> Config {
+    match toml::from_str(settings) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Invalid config format.");
+            eprintln!("Error message: {}", e.message());
+            if e.message().starts_with("missing field") {
+                eprintln!("To resolve this error, add the missing field in your configuration.")
+            }
+            eprintln!("To generate a new, clean config, delete or rename config.toml.");
+            panic!()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let program_start = Instant::now();
-    let settings = match fs::read(CONFIG_FILE) {
+    let config_pathbuf = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(CONFIG_FILE);
+    let config_path = config_pathbuf.as_path();
+    let settings = match fs::read(config_path) {
         Ok(s) => s,
         Err(e) => match e.kind() {
             ErrorKind::NotFound => {
-                if let Err(e) = fs::write(CONFIG_FILE, BASE_DATA) {
+                if let Err(e) = fs::write(config_path, BASE_DATA) {
                     panic!("Could not write default config to file: {e}")
                 }
                 BASE_DATA.to_vec()
@@ -644,21 +675,10 @@ async fn main() {
             }
         },
     };
-    let settings = String::from_utf8(settings).expect("Config file contains invalid UTF-8.");
-    let settings: Config = match toml::from_str(&settings) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Invalid config format.");
-            eprintln!("Error message: {}", e.message());
-            if e.message().starts_with("missing field") {
-                eprintln!("To resolve this error, add the missing field in your configuration.")
-            }
-            eprintln!("To generate a new, clean config, delete or rename config.toml.");
-            panic!()
-        }
-    };
+    let settings = str::from_utf8(&settings).expect("Config file contains invalid UTF-8.");
+    let settings: ArcSwap<Config> = ArcSwap::from_pointee(decode_config(settings));
     tracing_subscriber::fmt()
-        .with_max_level(match &*settings.server.log_level.to_ascii_uppercase() {
+        .with_max_level(match &*settings.load().server.log_level.to_ascii_uppercase() {
             "TRACE" => Level::TRACE,
             "DEBUG" => Level::DEBUG,
             "INFO" => Level::INFO,
@@ -674,11 +694,56 @@ async fn main() {
         })
         .init();
     let threads = Arc::new(AtomicI32::new(0));
-    let listener = TcpListener::bind(SocketAddr::new(settings.server.bind, settings.server.port))
+    let loaded = settings.load();
+    let listener = TcpListener::bind(SocketAddr::new(loaded.server.bind, loaded.server.port))
         .await
         .unwrap();
     let shared_settings = Arc::new(settings);
     let world = Arc::new(RwLock::new(world::Level::new(None)));
+    let watcher_settings = Arc::clone(&shared_settings);
+    tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::channel::<Event>(100);
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                let _ = tx.blocking_send(event);
+            }
+        })
+        .unwrap();
+        if let Err(e) = watcher.watch(&config_pathbuf, RecursiveMode::NonRecursive) {
+            warn!("Couldn't watch config file: {e}");
+        }
+        while let Some(event) = rx.recv().await {
+            if let notify::EventKind::Access(notify::event::AccessKind::Open(_)) = event.kind {
+                continue;
+            }
+            info!("Config updated: {event:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut i = 0;
+            while let Ok(_) = rx.try_recv() {
+                i += 1
+            }
+            info!("Debounced {i} writes");
+            let settings = match fs::read(&config_pathbuf) {
+                Ok(s) => s,
+                Err(e) => match e.kind() {
+                    ErrorKind::NotFound => {
+                        error!("The config file was deleted. Skipping swap of configuration");
+                        continue;
+                    }
+                    ErrorKind::PermissionDenied => {
+                        panic!("Permission denied reading config file.")
+                    }
+                    e => {
+                        panic!("Unknown error reading config file: {e}")
+                    }
+                },
+            };
+            let settings = str::from_utf8(&settings).expect("File contains invalid UTF-8");
+            let new_config = decode_config(settings);
+            watcher_settings.store(Arc::new(new_config));
+        }
+        warn!("Watch error");
+    });
     event!(Level::INFO, "Ready in {:?}", program_start.elapsed());
     loop {
         let stream = listener.accept().await;

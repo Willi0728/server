@@ -479,62 +479,6 @@ pub fn set_chunk_cache_center(x: i32, z: i32) -> Vec<u8> {
     buf
 }
 
-pub fn level_chunk_with_light(x: i32, z: i32) -> Vec<u8> {
-    let mut buf = vec![];
-    buf.extend(x.to_be_bytes());
-    buf.extend(z.to_be_bytes());
-    buf.extend(<[i32]>::serialize(&[]));
-
-    let mut section1 = vec![];
-    //block states:
-    section1.extend(&[0x10, 0x00]); // Number of non-air blocks
-    section1.push(0); //Bits Per Entry
-    section1.push(1); // block id of stone
-
-    //biomes:
-    section1.push(0); // bits per entry
-    section1.push(55); // plains? whatever 0 is. maybe void
-
-    let mut sections = vec![];
-    sections.extend(&[0x00, 0x00]); // non air blocks
-    sections.push(0); // bits per entry
-    sections.push(0); // air
-    sections.push(0); // bpe
-    sections.push(55); // whatever biome it is
-
-    buf.extend((section1.len() as i32 + (sections.len() as i32) * 23).serialize());
-    buf.extend(section1.repeat(2));
-    buf.extend(sections.repeat(22)); // 24 sections total
-
-    let block_entities: Vec<VarInt> = vec![];
-    // we'll figure out the impl Seralize details for (u8, i16, VarInt, NBT). rn it's just no block entities.
-    // TODO we just need it to compile for now
-    buf.extend(block_entities.serialize());
-
-    //light data?
-    buf.extend(full_bitset(26)); // Sky Light fullbright
-    buf.extend(empty_bitset()); // No block light
-    buf.extend(empty_bitset()); // confirm that no chunks are without Sky Light
-    buf.extend(full_bitset(26)); // no block light
-    buf.extend([light_section(); 26].serialize()); // fullbright skylight
-    buf.extend(<[i32]>::serialize(&[])); // empty block light
-    buf
-}
-
-pub fn light_section() -> [u8; 2048] {
-    [0xFF; 2048] // TODO is fullbright rn
-}
-
-pub fn full_bitset(bits: u32) -> Vec<u8> {
-    let mut buf = vec![1];
-    buf.extend(((1u64 << bits) - 1).to_be_bytes());
-    buf
-}
-
-pub fn empty_bitset() -> Vec<u8> {
-    vec![0]
-}
-
 pub fn set_default_spawn_position(
     dimension_name: String,
     location: (i32, i32, i16),
