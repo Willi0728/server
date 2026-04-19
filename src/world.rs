@@ -36,19 +36,24 @@ pub struct Level {
 
 #[derive(Debug)]
 pub struct LevelChunk {
-    sections: [ChunkSection; 24],
-    skylight: [LightSection; 26],
-    blocklight: [LightSection; 26],
+    // stack size: 3712 heap min 0 max 3553256                    | switch at 9 bpe: stack 3712 heap min 0 max 304688
+    sections: [ChunkSection; 24], // heap 143615 * 24 = 3446760 | 0198192
+    skylight: [LightSection; 26], // heap 2048   * 26 = 0053248 | 0053248
+    blocklight: [LightSection; 26], // heap 2048   * 26 = 0053248 | 0053248
 }
 
 #[derive(Debug)]
 pub enum LightSection {
+    // heap size: min 0 max 2048
     Single(u8),
     Direct(Box<[u8; 2048]>),
 }
 
 #[derive(Debug)]
 pub struct ChunkSection {
+    // heap size min 0 max 143615
+    // if we switch at 9 bpe, then
+    // heap size min 0 max 8258
     block_count: u16,
     block_states: BlockPalettedContainer,
     biomes: BiomePalettedContainer,
@@ -56,6 +61,13 @@ pub struct ChunkSection {
 
 #[derive(Debug)]
 pub enum PalettedContainer<T> {
+    // heap size min 0 max max(1 + T::MAX * size_of::<T>() + ((size_of::<T>() * 8 * 4096 + 63) & !63) / 8, size_of::<T>() * 4096)
+    // u8 = 4352
+    // u16 = 139263
+    // if we switch at 9 bpe, then
+    // heap size min 0 max size_of::<T>() * 4096 (for blocks) 64 (for biomes)
+    // u8 = 64
+    // u16 = 8192
     Single(T),
     Indirect {
         bits_per_entry: u8,
@@ -403,8 +415,8 @@ impl ChunkSection {
 
         let previous_block_state = self.get_block(x, y, z);
         let entry_index = Self::entry_index(x, y, z);
-        self.block_states =
-            match std::mem::replace(&mut self.block_states, PalettedContainer::Single(0)) {
+        let mut converted_to_direct = None;
+        self.block_states = match std::mem::replace(&mut self.block_states, PalettedContainer::Single(0)) {
                 PalettedContainer::Single(state) if block_state == state => {
                     PalettedContainer::Single(state)
                 }
@@ -423,22 +435,37 @@ impl ChunkSection {
                     mut palette,
                     mut data,
                 } => {
-                    let palette_index = match palette.iter().position(|&state| state == block_state)
-                    {
+                    let palette_index = match palette.iter().position(|&state| state == block_state) {
                         Some(index) => index,
                         None => {
                             let next_index = palette.len();
                             let required_bits = Self::bits_required_for_palette_len(next_index + 1);
-                            if required_bits > bits_per_entry {
-                                data =
-                                    Self::repack_packed_data(&data, bits_per_entry, required_bits);
-                                bits_per_entry = required_bits;
+                            if required_bits >= 9 {
+                                let mut direct = vec![0; 4096];
+                                for (entry_index, slot) in direct.iter_mut().enumerate() {
+                                    let palette_index =
+                                        Self::packed_entry(&data, entry_index, bits_per_entry)
+                                            as usize;
+                                    *slot = palette[palette_index];
+                                }
+                                direct[entry_index] = block_state;
+                                converted_to_direct = Some(PalettedContainer::Direct(direct));
+                                0
+                            } else {
+                                if required_bits > bits_per_entry {
+                                    data =
+                                        Self::repack_packed_data(&data, bits_per_entry, required_bits);
+                                    bits_per_entry = required_bits;
+                                }
+                                palette.push(block_state);
+                                next_index
                             }
-                            palette.push(block_state);
-                            next_index
                         }
                     };
 
+                    if let Some(container) = converted_to_direct {
+                        container
+                    } else {
                     Self::set_packed_entry(
                         &mut data,
                         entry_index,
@@ -449,6 +476,7 @@ impl ChunkSection {
                         bits_per_entry,
                         palette,
                         data,
+                    }
                     }
                 }
                 PalettedContainer::Direct(mut data) => {
@@ -608,5 +636,24 @@ mod tests {
             0b1_1010
         );
         assert_eq!(data[0] >> 60, 0);
+    }
+
+    #[test]
+    fn switches_to_direct_at_nine_bits_per_entry() {
+        let mut section = ChunkSection::new();
+
+        for block_state in 1..=256 {
+            let x = ((block_state - 1) & 0xF) as u8;
+            let z = (((block_state - 1) >> 4) & 0xF) as u8;
+            let y = (((block_state - 1) >> 8) & 0xF) as u8;
+            section.set_block(x, y, z, block_state as u16);
+        }
+
+        let PalettedContainer::Direct(data) = &section.block_states else {
+            panic!("expected direct block states after exceeding 8 bits per entry");
+        };
+
+        assert_eq!(data[ChunkSection::entry_index(0, 0, 0)], 1);
+        assert_eq!(data[ChunkSection::entry_index(15, 0, 15)], 256);
     }
 }
