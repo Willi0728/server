@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use toml;
 use tracing::{Level, error, event, info, warn};
+use tracing_subscriber::{filter::LevelFilter, prelude::*, reload};
 
 const DISCONNECT: &[u8] = &[
     0x21, 0x00, 0x1F, 0x7B, 0x22, 0x74, 0x65, 0x78, 0x74, 0x22, 0x3A, 0x20, 0x22, 0x54, 0x68, 0x65,
@@ -649,6 +650,28 @@ fn decode_config(settings: &str) -> Config {
     }
 }
 
+fn decode_log_level(level: &str, use_tracing: bool) -> LevelFilter {
+    match &*level.to_ascii_uppercase() {
+        "TRACE" => LevelFilter::TRACE,
+        "DEBUG" => LevelFilter::DEBUG,
+        "INFO" => LevelFilter::INFO,
+        "WARN" => LevelFilter::WARN,
+        "ERROR" => LevelFilter::ERROR,
+        l if use_tracing => {
+            warn!("Log level was set to {l}, which is not one of: TRACE, DEBUG, INFO, WARN, ERROR");
+            warn!("Defaulting to INFO");
+            LevelFilter::INFO
+        }
+        level => {
+            eprintln!(
+                "WARNING: Log level was set to {level}, which is not one of TRACE, DEBUG, INFO, WARN, ERROR"
+            );
+            eprintln!("WARNING: Defaulting to INFO");
+            LevelFilter::INFO
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let program_start = Instant::now();
@@ -677,21 +700,11 @@ async fn main() {
     };
     let settings = str::from_utf8(&settings).expect("Config file contains invalid UTF-8.");
     let settings: ArcSwap<Config> = ArcSwap::from_pointee(decode_config(settings));
-    tracing_subscriber::fmt()
-        .with_max_level(match &*settings.load().server.log_level.to_ascii_uppercase() {
-            "TRACE" => Level::TRACE,
-            "DEBUG" => Level::DEBUG,
-            "INFO" => Level::INFO,
-            "WARN" => Level::WARN,
-            "ERROR" => Level::ERROR,
-            level => {
-                eprintln!(
-                    "WARNING: Log level was set to {level}, which is not one of TRACE, DEBUG, INFO, WARN, ERROR"
-                );
-                eprintln!("WARNING: Defaulting to INFO");
-                Level::INFO
-            }
-        })
+    let (log_level, log_level_handle) =
+        reload::Layer::new(decode_log_level(&settings.load().server.log_level, false));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_level)
         .init();
     let threads = Arc::new(AtomicI32::new(0));
     let loaded = settings.load();
@@ -701,6 +714,7 @@ async fn main() {
     let shared_settings = Arc::new(settings);
     let world = Arc::new(RwLock::new(world::Level::new(None)));
     let watcher_settings = Arc::clone(&shared_settings);
+    let watcher_log_level = log_level_handle.clone();
     tokio::spawn(async move {
         let (tx, mut rx) = mpsc::channel::<Event>(100);
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
@@ -716,7 +730,7 @@ async fn main() {
             if let notify::EventKind::Access(notify::event::AccessKind::Open(_)) = event.kind {
                 continue;
             }
-            info!("Config updated: {event:?}");
+            info!("Config was updated");
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let mut i = 0;
             while let Ok(_) = rx.try_recv() {
@@ -731,7 +745,10 @@ async fn main() {
                         continue;
                     }
                     ErrorKind::PermissionDenied => {
-                        panic!("Permission denied reading config file.")
+                        error!(
+                            "Permission denied reading config file. Skipping swap of configuration"
+                        );
+                        continue;
                     }
                     e => {
                         panic!("Unknown error reading config file: {e}")
@@ -740,6 +757,9 @@ async fn main() {
             };
             let settings = str::from_utf8(&settings).expect("File contains invalid UTF-8");
             let new_config = decode_config(settings);
+            watcher_log_level
+                .modify(|level| *level = decode_log_level(&new_config.server.log_level, true))
+                .expect("tracing log level reload should succeed");
             watcher_settings.store(Arc::new(new_config));
         }
         warn!("Watch error");
