@@ -469,10 +469,6 @@ pub fn set_entity_metadata(eid: i32) -> Vec<u8> {
     buf
 }
 
-pub fn bundle_delimiter() -> Vec<u8> {
-    vec![]
-}
-
 pub fn set_chunk_cache_center(x: i32, z: i32) -> Vec<u8> {
     let mut buf = x.serialize();
     buf.extend(z.serialize());
